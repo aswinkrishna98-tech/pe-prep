@@ -1,6 +1,5 @@
 require("dotenv").config();
 const path = require("path");
-const fs = require("fs");
 const express = require("express");
 const cors = require("cors");
 
@@ -16,7 +15,7 @@ app.use(cors({ origin: CORS_ORIGIN }));
 app.post(
   "/api/webhook",
   express.raw({ type: "application/json" }),
-  (req, res) => {
+  async (req, res) => {
     const signatureHeader = req.headers["x-razorpay-signature"];
     let valid = false;
     try {
@@ -35,14 +34,19 @@ app.post(
       const payment = event.payload.payment.entity;
       const { userId, plan } = payment.notes || {};
       if (userId && plan) {
-        db.setPlan(userId, plan);
-        db.recordOrder(userId, {
-          orderId: payment.order_id,
-          paymentId: payment.id,
-          amount: payment.amount,
-          source: "webhook",
-        });
-        console.log(`[webhook] Activated "${plan}" for user ${userId}`);
+        try {
+          await db.setPlan(userId, plan);
+          await db.recordOrder(userId, {
+            orderId: payment.order_id,
+            paymentId: payment.id,
+            amount: payment.amount,
+            source: "webhook",
+          });
+          console.log(`[webhook] Activated "${plan}" for user ${userId}`);
+        } catch (e) {
+          console.error("[webhook] Failed to persist plan/order:", e.message);
+          return res.status(500).send("Failed to record payment");
+        }
       }
     }
     res.json({ received: true });
@@ -51,11 +55,15 @@ app.post(
 
 app.use(express.json());
 
-app.get("/api/plan/:userId", (req, res) => {
-  const user = db.getUser(req.params.userId);
-  res.json({ plan: user.plan });
+app.get("/api/plan/:userId", async (req, res) => {
+  try {
+    const user = await db.getUser(req.params.userId);
+    res.json({ plan: user.plan });
+  } catch (e) {
+    console.error("plan lookup failed:", e.message);
+    res.status(500).json({ error: "Could not look up plan" });
+  }
 });
-
 app.post("/api/create-order", async (req, res) => {
   const { userId, plan } = req.body || {};
   if (!userId || !plan) {
@@ -79,8 +87,7 @@ app.post("/api/create-order", async (req, res) => {
     res.status(500).json({ error: message });
   }
 });
-
-app.post("/api/verify-payment", (req, res) => {
+app.post("/api/verify-payment", async (req, res) => {
   const {
     userId,
     plan,
@@ -99,11 +106,16 @@ app.post("/api/verify-payment", (req, res) => {
     return res.status(400).json({ error: "Payment signature verification failed" });
   }
 
-  const user = db.setPlan(userId, plan);
-  db.recordOrder(userId, { orderId, paymentId, source: "verify-payment" });
-  res.json({ success: true, plan: user.plan });
+  try {
+    const user = await db.setPlan(userId, plan);
+    await db.recordOrder(userId, { orderId, paymentId, source: "verify-payment" });
+    res.json({ success: true, plan: user.plan });
+  } catch (e) {
+    console.error("verify-payment failed to persist:", e.message);
+    res.status(500).json({ error: "Payment verified but could not be saved - contact support." });
+  }
 });
-
+const fs = require("fs");
 const FRONTEND_INDEX = path.join(__dirname, "index.html");
 app.use(express.static(__dirname));
 app.get("*", (req, res) => {
@@ -117,10 +129,19 @@ app.get("*", (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`PE Prep server listening on http://localhost:${PORT}`);
-  if (!process.env.RAZORPAY_KEY_ID) {
-    console.warn("RAZORPAY_KEY_ID is not set - set it in Render's environment variables.");
-  }
-});
-
+db.ensureSchema()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`PE Prep server listening on http://localhost:${PORT}`);
+      if (!process.env.RAZORPAY_KEY_ID) {
+        console.warn(
+          "RAZORPAY_KEY_ID is not set - copy .env.example to .env and add your keys, " +
+            "or payment endpoints will fail. See server/README.md."
+        );
+      }
+    });
+  })
+  .catch((e) => {
+    console.error("Failed to initialize database schema - check DATABASE_URL:", e.message);
+    process.exit(1);
+  });
