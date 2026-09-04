@@ -1,7 +1,7 @@
 {
   "name": "pe-prep-payments-server",
   "version": "1.0.0",
-  "description": "Backend for PE Prep - Razorpay order creation, payment verification, and webhook handling.",
+  "description": "Backend for PE Prep — Razorpay order creation, payment verification, and webhook handling. Also serves the PE Prep front-end (index.html) as a single deployable unit.",
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
@@ -15,7 +15,7 @@
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
+    "pg": "^8.13.1",
     "razorpay": "^2.9.4"
   }
 }
-
