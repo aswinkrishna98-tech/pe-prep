@@ -1,4 +1,5 @@
 const { Pool } = require("pg");
+const crypto = require("crypto");
 
 const connectionString = process.env.DATABASE_URL;
 if (!connectionString) {
@@ -30,6 +31,28 @@ async function ensureSchema() {
       amount INTEGER,
       source TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  // Real login accounts (email+password and/or Google). A signed-in user's
+  // `id` here doubles as their `user_id` in the `users`/`orders` tables
+  // above, so their plan/payment history keeps working unchanged once they
+  // sign in — no separate identity to reconcile.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS accounts (
+      id TEXT PRIMARY KEY,
+      email TEXT UNIQUE NOT NULL,
+      password_hash TEXT,
+      google_sub TEXT UNIQUE,
+      name TEXT NOT NULL DEFAULT 'Aspirant',
+      xp INTEGER NOT NULL DEFAULT 0,
+      streak INTEGER NOT NULL DEFAULT 0,
+      last_active_date TEXT,
+      questions_solved INTEGER NOT NULL DEFAULT 0,
+      accuracy_sum INTEGER NOT NULL DEFAULT 0,
+      mock_tests_taken INTEGER NOT NULL DEFAULT 0,
+      revealed_ids JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
 }
@@ -67,4 +90,77 @@ async function recordOrder(userId, order) {
   );
 }
 
-module.exports = { pool, ensureSchema, getUser, setPlan, recordOrder };
+// ---------------------------------------------------------------------------
+// Accounts (real login)
+// ---------------------------------------------------------------------------
+const ACCOUNT_FIELDS = `id, email, name, xp, streak, last_active_date AS "lastActiveDate", ` +
+  `questions_solved AS "questionsSolved", accuracy_sum AS "accuracySum", mock_tests_taken AS "mockTestsTaken", ` +
+  `revealed_ids AS "revealedIds", created_at AS "createdAt"`;
+
+async function createAccount({ email, passwordHash, googleSub, name }) {
+  const id = crypto.randomUUID();
+  const { rows } = await pool.query(
+    `INSERT INTO accounts (id, email, password_hash, google_sub, name)
+     VALUES ($1, $2, $3, $4, $5)
+     RETURNING ${ACCOUNT_FIELDS}`,
+    [id, email, passwordHash || null, googleSub || null, (name || "Aspirant").slice(0, 40)]
+  );
+  return rows[0];
+}
+
+async function getAccountByEmail(email) {
+  const { rows } = await pool.query(
+    `SELECT ${ACCOUNT_FIELDS}, password_hash AS "passwordHash" FROM accounts WHERE email = $1`,
+    [email]
+  );
+  return rows[0] || null;
+}
+
+async function getAccountByGoogleSub(googleSub) {
+  const { rows } = await pool.query(`SELECT ${ACCOUNT_FIELDS} FROM accounts WHERE google_sub = $1`, [googleSub]);
+  return rows[0] || null;
+}
+
+async function getAccountById(id) {
+  const { rows } = await pool.query(`SELECT ${ACCOUNT_FIELDS} FROM accounts WHERE id = $1`, [id]);
+  return rows[0] || null;
+}
+
+async function linkGoogleSub(accountId, googleSub) {
+  await pool.query(`UPDATE accounts SET google_sub = $2, updated_at = now() WHERE id = $1`, [accountId, googleSub]);
+}
+
+const PROFILE_FIELD_COLUMNS = {
+  name: "name",
+  xp: "xp",
+  streak: "streak",
+  lastActiveDate: "last_active_date",
+  questionsSolved: "questions_solved",
+  accuracySum: "accuracy_sum",
+  mockTestsTaken: "mock_tests_taken",
+  revealedIds: "revealed_ids",
+};
+
+async function updateAccountProfile(accountId, fields) {
+  const sets = [];
+  const values = [accountId];
+  let i = 2;
+  for (const [key, column] of Object.entries(PROFILE_FIELD_COLUMNS)) {
+    if (fields[key] === undefined) continue;
+    sets.push(`${column} = $${i}`);
+    values.push(key === "revealedIds" ? JSON.stringify(fields[key]) : (key === "name" ? String(fields[key]).slice(0, 40) : fields[key]));
+    i++;
+  }
+  if (sets.length === 0) return getAccountById(accountId);
+  sets.push("updated_at = now()");
+  const { rows } = await pool.query(
+    `UPDATE accounts SET ${sets.join(", ")} WHERE id = $1 RETURNING ${ACCOUNT_FIELDS}`,
+    values
+  );
+  return rows[0];
+}
+
+module.exports = {
+  pool, ensureSchema, getUser, setPlan, recordOrder,
+  createAccount, getAccountByEmail, getAccountByGoogleSub, getAccountById, linkGoogleSub, updateAccountProfile,
+};

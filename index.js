@@ -2,6 +2,9 @@ require("dotenv").config();
 const path = require("path");
 const express = require("express");
 const cors = require("cors");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const { OAuth2Client } = require("google-auth-library");
 
 const db = require("./db");
 const { createOrder, verifyPaymentSignature, verifyWebhookSignature } = require("./razorpay");
@@ -9,6 +12,17 @@ const { createOrder, verifyPaymentSignature, verifyWebhookSignature } = require(
 const app = express();
 const PORT = process.env.PORT || 4000;
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
+
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  console.warn(
+    "JWT_SECRET is not set - using an insecure development default. " +
+      "Set a real random JWT_SECRET in Render's environment variables before real users sign up."
+  );
+}
+const EFFECTIVE_JWT_SECRET = JWT_SECRET || "dev-insecure-secret-change-me";
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
+const googleClient = GOOGLE_CLIENT_ID ? new OAuth2Client(GOOGLE_CLIENT_ID) : null;
 
 app.use(cors({ origin: CORS_ORIGIN }));
 
@@ -55,6 +69,133 @@ app.post(
 
 app.use(express.json());
 
+// ---------------------------------------------------------------------------
+// Auth helpers
+// ---------------------------------------------------------------------------
+function signToken(accountId) {
+  return jwt.sign({ sub: accountId }, EFFECTIVE_JWT_SECRET, { expiresIn: "180d" });
+}
+
+function requireAuth(req, res, next) {
+  const header = req.headers.authorization || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ error: "Not signed in" });
+  try {
+    const payload = jwt.verify(token, EFFECTIVE_JWT_SECRET);
+    req.accountId = payload.sub;
+    next();
+  } catch (e) {
+    return res.status(401).json({ error: "Session expired - please sign in again" });
+  }
+}
+
+async function accountWithPlan(account) {
+  const userRow = await db.getUser(account.id);
+  return { ...account, plan: userRow.plan };
+}
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+// ---------------------------------------------------------------------------
+// Auth routes
+// ---------------------------------------------------------------------------
+app.post("/api/auth/signup", async (req, res) => {
+  const { email, password, name } = req.body || {};
+  const normalizedEmail = String(email || "").trim().toLowerCase();
+  if (!EMAIL_RE.test(normalizedEmail) || !password || String(password).length < 6) {
+    return res.status(400).json({ error: "A valid email and a password of at least 6 characters are required" });
+  }
+  try {
+    const existing = await db.getAccountByEmail(normalizedEmail);
+    if (existing) {
+      return res.status(409).json({ error: "An account with this email already exists — try signing in instead." });
+    }
+    const passwordHash = await bcrypt.hash(String(password), 10);
+    const account = await db.createAccount({ email: normalizedEmail, passwordHash, name });
+    const token = signToken(account.id);
+    res.json({ token, user: await accountWithPlan(account) });
+  } catch (e) {
+    console.error("signup failed:", e.message);
+    res.status(500).json({ error: "Could not create account — please try again." });
+  }
+});
+
+app.post("/api/auth/login", async (req, res) => {
+  const { email, password } = req.body || {};
+  const normalizedEmail = String(email || "").trim().toLowerCase();
+  if (!normalizedEmail || !password) {
+    return res.status(400).json({ error: "Email and password are required" });
+  }
+  try {
+    const account = await db.getAccountByEmail(normalizedEmail);
+    if (!account || !account.passwordHash) {
+      return res.status(401).json({ error: "Incorrect email or password" });
+    }
+    const ok = await bcrypt.compare(String(password), account.passwordHash);
+    if (!ok) return res.status(401).json({ error: "Incorrect email or password" });
+    delete account.passwordHash;
+    const token = signToken(account.id);
+    res.json({ token, user: await accountWithPlan(account) });
+  } catch (e) {
+    console.error("login failed:", e.message);
+    res.status(500).json({ error: "Login failed — please try again." });
+  }
+});
+
+app.post("/api/auth/google", async (req, res) => {
+  if (!googleClient) {
+    return res.status(501).json({ error: "Google sign-in isn't configured on the server yet" });
+  }
+  const { credential } = req.body || {};
+  if (!credential) return res.status(400).json({ error: "Missing Google credential" });
+  try {
+    const ticket = await googleClient.verifyIdToken({ idToken: credential, audience: GOOGLE_CLIENT_ID });
+    const payload = ticket.getPayload();
+    const { sub, email, name } = payload;
+    const normalizedEmail = String(email || "").toLowerCase();
+    let account = await db.getAccountByGoogleSub(sub);
+    if (!account) {
+      const byEmail = await db.getAccountByEmail(normalizedEmail);
+      if (byEmail) {
+        await db.linkGoogleSub(byEmail.id, sub);
+        account = await db.getAccountById(byEmail.id);
+      } else {
+        account = await db.createAccount({ email: normalizedEmail, googleSub: sub, name });
+      }
+    }
+    const token = signToken(account.id);
+    res.json({ token, user: await accountWithPlan(account) });
+  } catch (e) {
+    console.error("google auth failed:", e.message);
+    res.status(401).json({ error: "Google sign-in failed — please try again." });
+  }
+});
+
+app.get("/api/auth/me", requireAuth, async (req, res) => {
+  try {
+    const account = await db.getAccountById(req.accountId);
+    if (!account) return res.status(404).json({ error: "Account not found" });
+    res.json({ user: await accountWithPlan(account) });
+  } catch (e) {
+    console.error("auth/me failed:", e.message);
+    res.status(500).json({ error: "Could not load account" });
+  }
+});
+
+app.put("/api/profile", requireAuth, async (req, res) => {
+  try {
+    const account = await db.updateAccountProfile(req.accountId, req.body || {});
+    res.json({ user: await accountWithPlan(account) });
+  } catch (e) {
+    console.error("profile update failed:", e.message);
+    res.status(500).json({ error: "Could not save profile" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Payments routes (unchanged — a signed-in user's account id doubles as
+// their payments userId, so these work the same for guests and accounts)
+// ---------------------------------------------------------------------------
 app.get("/api/plan/:userId", async (req, res) => {
   try {
     const user = await db.getUser(req.params.userId);
