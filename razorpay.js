@@ -16,6 +16,17 @@ function getClient() {
   return new Razorpay({ key_id: RAZORPAY_KEY_ID, key_secret: RAZORPAY_KEY_SECRET });
 }
 
+// Razorpay caps `receipt` at a small fixed length (observed: rejects anything
+// over 56 chars). `userId` used to always be a short guest-generated id
+// ("u_abc123..."), so `pe-prep-${userId}-${Date.now()}` fit comfortably - but
+// a signed-in account's id is a full UUID (36 chars), which pushes that same
+// template past the limit and makes every checkout for a signed-in user fail
+// with a 500. Hash userId down to a fixed-length fragment so the receipt's
+// length never depends on how long the caller's id happens to be.
+function shortId(str) {
+  return crypto.createHash("sha256").update(String(str)).digest("hex").slice(0, 10);
+}
+
 async function createOrder({ plan, userId }) {
   const amount = PLAN_AMOUNTS_INR[plan];
   if (!amount) {
@@ -25,7 +36,7 @@ async function createOrder({ plan, userId }) {
   const order = await client.orders.create({
     amount,
     currency: "INR",
-    receipt: `pe-prep-${userId}-${Date.now()}`,
+    receipt: `pep-${shortId(userId)}-${Date.now().toString(36)}`,
     notes: { userId, plan },
   });
   return order;
@@ -53,4 +64,3 @@ function verifyWebhookSignature({ rawBody, signatureHeader }) {
 }
 
 module.exports = { PLAN_AMOUNTS_INR, createOrder, verifyPaymentSignature, verifyWebhookSignature };
-
