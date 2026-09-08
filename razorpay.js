@@ -6,6 +6,12 @@ const PLAN_AMOUNTS_INR = {
   proplus: 89900,
 };
 
+// A single-exam pass ("KVS Pass" etc.) — full Pro-level access (unlimited
+// mock tests, full result analysis, previous year papers) for one exam only,
+// priced well below the flat Pro tier since most aspirants only care about
+// one exam at a time.
+const EXAM_PASS_PRICE_INR = 14900; // ₹149
+
 function getClient() {
   const { RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET } = process.env;
   if (!RAZORPAY_KEY_ID || !RAZORPAY_KEY_SECRET) {
@@ -27,17 +33,23 @@ function shortId(str) {
   return crypto.createHash("sha256").update(String(str)).digest("hex").slice(0, 10);
 }
 
-async function createOrder({ plan, userId }) {
-  const amount = PLAN_AMOUNTS_INR[plan];
-  if (!amount) {
-    throw new Error(`Unknown plan "${plan}". Expected "pro" or "proplus".`);
+async function createOrder({ plan, userId, examId }) {
+  let amount;
+  if (plan === "exampass") {
+    if (!examId) throw new Error('An examId is required to buy an exam pass.');
+    amount = EXAM_PASS_PRICE_INR;
+  } else {
+    amount = PLAN_AMOUNTS_INR[plan];
+    if (!amount) {
+      throw new Error(`Unknown plan "${plan}". Expected "pro", "proplus" or "exampass".`);
+    }
   }
   const client = getClient();
   const order = await client.orders.create({
     amount,
     currency: "INR",
     receipt: `pep-${shortId(userId)}-${Date.now().toString(36)}`,
-    notes: { userId, plan },
+    notes: examId ? { userId, plan, examId } : { userId, plan },
   });
   return order;
 }
@@ -63,4 +75,4 @@ function verifyWebhookSignature({ rawBody, signatureHeader }) {
   return expected === signatureHeader;
 }
 
-module.exports = { PLAN_AMOUNTS_INR, createOrder, verifyPaymentSignature, verifyWebhookSignature };
+module.exports = { PLAN_AMOUNTS_INR, EXAM_PASS_PRICE_INR, createOrder, verifyPaymentSignature, verifyWebhookSignature };

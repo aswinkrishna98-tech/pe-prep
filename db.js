@@ -59,18 +59,55 @@ async function ensureSchema() {
   // Added after the initial release — ADD COLUMN IF NOT EXISTS so this is
   // safe to re-run against a database that already has the accounts table.
   await pool.query(`ALTER TABLE accounts ADD COLUMN IF NOT EXISTS preferred_exam TEXT;`);
+
+  // Exam-specific passes ("KVS Pass", etc.) — a cheaper alternative to full
+  // Pro that unlocks unlimited mock tests, full result analysis and PYQs for
+  // ONE exam only. Keyed by the same `user_id` as `users`/`orders` (a guest's
+  // local id, or a signed-in account's id), never by `accounts.id` alone, so
+  // it works identically for guests and signed-in users like the rest of the
+  // payments schema. A user can hold passes for several exams at once.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS exam_passes (
+      id SERIAL PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      exam_id TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE(user_id, exam_id)
+    );
+  `);
+}
+
+async function getExamPasses(userId) {
+  const { rows } = await pool.query("SELECT exam_id FROM exam_passes WHERE user_id = $1", [userId]);
+  return rows.map((r) => r.exam_id);
 }
 
 async function getUser(userId) {
   const { rows } = await pool.query("SELECT user_id, plan, updated_at FROM users WHERE user_id = $1", [userId]);
+  const examPasses = await getExamPasses(userId);
   if (rows.length === 0) {
-    return { plan: "free", updatedAt: null, orders: [] };
+    return { plan: "free", updatedAt: null, orders: [], examPasses };
   }
   const ordersRes = await pool.query(
     "SELECT order_id AS \"orderId\", payment_id AS \"paymentId\", amount, source, created_at AS \"at\" FROM orders WHERE user_id = $1 ORDER BY created_at ASC",
     [userId]
   );
-  return { plan: rows[0].plan, updatedAt: rows[0].updated_at, orders: ordersRes.rows };
+  return { plan: rows[0].plan, updatedAt: rows[0].updated_at, orders: ordersRes.rows, examPasses };
+}
+
+// Grants a user unlimited mock tests / full result analysis / PYQs for one
+// specific exam, without touching their overall `plan` — a signed-in
+// account's id or a guest's local id both work, exactly like setPlan below.
+// Idempotent: buying the same exam's pass twice is a no-op the second time.
+async function grantExamPass(userId, examId) {
+  await pool.query(
+    `INSERT INTO users (user_id, plan) VALUES ($1, 'free') ON CONFLICT (user_id) DO NOTHING`,
+    [userId]
+  );
+  await pool.query(
+    `INSERT INTO exam_passes (user_id, exam_id) VALUES ($1, $2) ON CONFLICT (user_id, exam_id) DO NOTHING`,
+    [userId, examId]
+  );
 }
 
 async function setPlan(userId, plan) {
@@ -166,6 +203,6 @@ async function updateAccountProfile(accountId, fields) {
 }
 
 module.exports = {
-  pool, ensureSchema, getUser, setPlan, recordOrder,
+  pool, ensureSchema, getUser, setPlan, recordOrder, getExamPasses, grantExamPass,
   createAccount, getAccountByEmail, getAccountByGoogleSub, getAccountById, linkGoogleSub, updateAccountProfile,
 };

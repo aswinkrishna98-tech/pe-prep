@@ -46,17 +46,21 @@ app.post(
     const event = JSON.parse(req.body.toString("utf8"));
     if (event.event === "payment.captured") {
       const payment = event.payload.payment.entity;
-      const { userId, plan } = payment.notes || {};
+      const { userId, plan, examId } = payment.notes || {};
       if (userId && plan) {
         try {
-          await db.setPlan(userId, plan);
+          if (plan === "exampass" && examId) {
+            await db.grantExamPass(userId, examId);
+          } else {
+            await db.setPlan(userId, plan);
+          }
           await db.recordOrder(userId, {
             orderId: payment.order_id,
             paymentId: payment.id,
             amount: payment.amount,
             source: "webhook",
           });
-          console.log(`[webhook] Activated "${plan}" for user ${userId}`);
+          console.log(`[webhook] Activated "${plan}"${examId ? ` (${examId})` : ""} for user ${userId}`);
         } catch (e) {
           console.error("[webhook] Failed to persist plan/order:", e.message);
           return res.status(500).send("Failed to record payment");
@@ -91,7 +95,7 @@ function requireAuth(req, res, next) {
 
 async function accountWithPlan(account) {
   const userRow = await db.getUser(account.id);
-  return { ...account, plan: userRow.plan };
+  return { ...account, plan: userRow.plan, examPasses: userRow.examPasses || [] };
 }
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -199,19 +203,22 @@ app.put("/api/profile", requireAuth, async (req, res) => {
 app.get("/api/plan/:userId", async (req, res) => {
   try {
     const user = await db.getUser(req.params.userId);
-    res.json({ plan: user.plan });
+    res.json({ plan: user.plan, examPasses: user.examPasses || [] });
   } catch (e) {
     console.error("plan lookup failed:", e.message);
     res.status(500).json({ error: "Could not look up plan" });
   }
 });
 app.post("/api/create-order", async (req, res) => {
-  const { userId, plan } = req.body || {};
+  const { userId, plan, examId } = req.body || {};
   if (!userId || !plan) {
     return res.status(400).json({ error: "userId and plan are required" });
   }
+  if (plan === "exampass" && !examId) {
+    return res.status(400).json({ error: "examId is required to buy an exam pass" });
+  }
   try {
-    const order = await createOrder({ plan, userId });
+    const order = await createOrder({ plan, userId, examId });
     res.json({
       orderId: order.id,
       amount: order.amount,
@@ -232,6 +239,7 @@ app.post("/api/verify-payment", async (req, res) => {
   const {
     userId,
     plan,
+    examId,
     razorpay_order_id: orderId,
     razorpay_payment_id: paymentId,
     razorpay_signature: signature,
@@ -239,6 +247,9 @@ app.post("/api/verify-payment", async (req, res) => {
 
   if (!userId || !plan || !orderId || !paymentId || !signature) {
     return res.status(400).json({ error: "Missing required fields" });
+  }
+  if (plan === "exampass" && !examId) {
+    return res.status(400).json({ error: "examId is required to verify an exam pass payment" });
   }
 
   const valid = verifyPaymentSignature({ orderId, paymentId, signature });
@@ -248,9 +259,16 @@ app.post("/api/verify-payment", async (req, res) => {
   }
 
   try {
-    const user = await db.setPlan(userId, plan);
-    await db.recordOrder(userId, { orderId, paymentId, source: "verify-payment" });
-    res.json({ success: true, plan: user.plan });
+    if (plan === "exampass") {
+      await db.grantExamPass(userId, examId);
+      await db.recordOrder(userId, { orderId, paymentId, source: "verify-payment" });
+      const examPasses = await db.getExamPasses(userId);
+      res.json({ success: true, examPasses });
+    } else {
+      const user = await db.setPlan(userId, plan);
+      await db.recordOrder(userId, { orderId, paymentId, source: "verify-payment" });
+      res.json({ success: true, plan: user.plan });
+    }
   } catch (e) {
     console.error("verify-payment failed to persist:", e.message);
     res.status(500).json({ error: "Payment verified but could not be saved - contact support." });
