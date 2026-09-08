@@ -51,10 +51,14 @@ async function ensureSchema() {
       accuracy_sum INTEGER NOT NULL DEFAULT 0,
       mock_tests_taken INTEGER NOT NULL DEFAULT 0,
       revealed_ids JSONB NOT NULL DEFAULT '{}'::jsonb,
+      preferred_exam TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
+  // Added after the initial release — ADD COLUMN IF NOT EXISTS so this is
+  // safe to re-run against a database that already has the accounts table.
+  await pool.query(`ALTER TABLE accounts ADD COLUMN IF NOT EXISTS preferred_exam TEXT;`);
 }
 
 async function getUser(userId) {
@@ -95,15 +99,15 @@ async function recordOrder(userId, order) {
 // ---------------------------------------------------------------------------
 const ACCOUNT_FIELDS = `id, email, name, xp, streak, last_active_date AS "lastActiveDate", ` +
   `questions_solved AS "questionsSolved", accuracy_sum AS "accuracySum", mock_tests_taken AS "mockTestsTaken", ` +
-  `revealed_ids AS "revealedIds", created_at AS "createdAt"`;
+  `revealed_ids AS "revealedIds", preferred_exam AS "preferredExam", created_at AS "createdAt"`;
 
-async function createAccount({ email, passwordHash, googleSub, name }) {
+async function createAccount({ email, passwordHash, googleSub, name, preferredExam }) {
   const id = crypto.randomUUID();
   const { rows } = await pool.query(
-    `INSERT INTO accounts (id, email, password_hash, google_sub, name)
-     VALUES ($1, $2, $3, $4, $5)
+    `INSERT INTO accounts (id, email, password_hash, google_sub, name, preferred_exam)
+     VALUES ($1, $2, $3, $4, $5, $6)
      RETURNING ${ACCOUNT_FIELDS}`,
-    [id, email, passwordHash || null, googleSub || null, (name || "Aspirant").slice(0, 40)]
+    [id, email, passwordHash || null, googleSub || null, (name || "Aspirant").slice(0, 40), preferredExam || null]
   );
   return rows[0];
 }
@@ -139,6 +143,7 @@ const PROFILE_FIELD_COLUMNS = {
   accuracySum: "accuracy_sum",
   mockTestsTaken: "mock_tests_taken",
   revealedIds: "revealed_ids",
+  preferredExam: "preferred_exam",
 };
 
 async function updateAccountProfile(accountId, fields) {

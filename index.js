@@ -100,7 +100,7 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 // Auth routes
 // ---------------------------------------------------------------------------
 app.post("/api/auth/signup", async (req, res) => {
-  const { email, password, name } = req.body || {};
+  const { email, password, name, preferredExam } = req.body || {};
   const normalizedEmail = String(email || "").trim().toLowerCase();
   if (!EMAIL_RE.test(normalizedEmail) || !password || String(password).length < 6) {
     return res.status(400).json({ error: "A valid email and a password of at least 6 characters are required" });
@@ -111,7 +111,7 @@ app.post("/api/auth/signup", async (req, res) => {
       return res.status(409).json({ error: "An account with this email already exists — try signing in instead." });
     }
     const passwordHash = await bcrypt.hash(String(password), 10);
-    const account = await db.createAccount({ email: normalizedEmail, passwordHash, name });
+    const account = await db.createAccount({ email: normalizedEmail, passwordHash, name, preferredExam: preferredExam || null });
     const token = signToken(account.id);
     res.json({ token, user: await accountWithPlan(account) });
   } catch (e) {
