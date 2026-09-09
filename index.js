@@ -93,6 +93,26 @@ function requireAuth(req, res, next) {
   }
 }
 
+// The site's admin dashboard is restricted to these accounts (matched by
+// their signed-in email) - keep this in sync with ADMIN_EMAILS in the
+// frontend's app-01-core.jsx. Unlike a shared client-side key, this can't be
+// extracted from the shipped JS bundle: it's checked against the real,
+// server-verified JWT identity of whoever is calling.
+const ADMIN_EMAILS = ["aswinkrishna98@gmail.com"];
+async function requireAdmin(req, res, next) {
+  requireAuth(req, res, async () => {
+    try {
+      const account = await db.getAccountById(req.accountId);
+      if (!account || !ADMIN_EMAILS.includes(String(account.email || "").toLowerCase())) {
+        return res.status(403).json({ error: "Forbidden" });
+      }
+      next();
+    } catch (e) {
+      res.status(500).json({ error: "Could not verify admin access" });
+    }
+  });
+}
+
 async function accountWithPlan(account) {
   const userRow = await db.getUser(account.id);
   return { ...account, plan: userRow.plan, examPasses: userRow.examPasses || [] };
@@ -276,9 +296,9 @@ app.post("/api/verify-payment", async (req, res) => {
 });
 // ---------------------------------------------------------------------------
 // Contact form. Public POST so any visitor can reach out; GET is read-only
-// and gated by a shared secret (ADMIN_API_KEY) the frontend's admin-only
-// dashboard sends as x-admin-key — no personal contact info of the site
-// owner is published anywhere on the site itself.
+// and requires a valid signed-in session for one of ADMIN_EMAILS (see
+// requireAdmin above) — no personal contact info of the site owner is
+// published anywhere on the site itself.
 // ---------------------------------------------------------------------------
 const CONTACT_MESSAGE_MAX = 4000;
 app.post("/api/contact", async (req, res) => {
@@ -305,11 +325,7 @@ app.post("/api/contact", async (req, res) => {
     res.status(500).json({ error: "Could not send your message - please try again." });
   }
 });
-app.get("/api/contact", async (req, res) => {
-  const ADMIN_API_KEY = process.env.ADMIN_API_KEY;
-  if (!ADMIN_API_KEY || req.headers["x-admin-key"] !== ADMIN_API_KEY) {
-    return res.status(403).json({ error: "Forbidden" });
-  }
+app.get("/api/contact", requireAdmin, async (req, res) => {
   try {
     const messages = await db.listContactMessages();
     res.json({ messages });
