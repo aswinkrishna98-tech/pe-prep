@@ -75,6 +75,35 @@ async function ensureSchema() {
       UNIQUE(user_id, exam_id)
     );
   `);
+
+  // Contact-form submissions. No personal identity of the site owner is
+  // published anywhere on the site — this is the inbox side of that: visitor
+  // messages land here and are only readable via the admin-gated dashboard.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS contact_messages (
+      id SERIAL PRIMARY KEY,
+      name TEXT,
+      email TEXT,
+      message TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+}
+
+async function createContactMessage({ name, email, message }) {
+  const { rows } = await pool.query(
+    `INSERT INTO contact_messages (name, email, message) VALUES ($1, $2, $3)
+     RETURNING id, name, email, message, created_at AS "createdAt"`,
+    [name || null, email || null, message]
+  );
+  return rows[0];
+}
+
+async function listContactMessages() {
+  const { rows } = await pool.query(
+    `SELECT id, name, email, message, created_at AS "createdAt" FROM contact_messages ORDER BY created_at DESC LIMIT 200`
+  );
+  return rows;
 }
 
 async function getExamPasses(userId) {
@@ -205,4 +234,5 @@ async function updateAccountProfile(accountId, fields) {
 module.exports = {
   pool, ensureSchema, getUser, setPlan, recordOrder, getExamPasses, grantExamPass,
   createAccount, getAccountByEmail, getAccountByGoogleSub, getAccountById, linkGoogleSub, updateAccountProfile,
+  createContactMessage, listContactMessages,
 };

@@ -274,6 +274,51 @@ app.post("/api/verify-payment", async (req, res) => {
     res.status(500).json({ error: "Payment verified but could not be saved - contact support." });
   }
 });
+// ---------------------------------------------------------------------------
+// Contact form. Public POST so any visitor can reach out; GET is read-only
+// and gated by a shared secret (ADMIN_API_KEY) the frontend's admin-only
+// dashboard sends as x-admin-key — no personal contact info of the site
+// owner is published anywhere on the site itself.
+// ---------------------------------------------------------------------------
+const CONTACT_MESSAGE_MAX = 4000;
+app.post("/api/contact", async (req, res) => {
+  const { name, email, message } = req.body || {};
+  const trimmedMessage = String(message || "").trim();
+  if (!trimmedMessage) {
+    return res.status(400).json({ error: "Message is required" });
+  }
+  if (trimmedMessage.length > CONTACT_MESSAGE_MAX) {
+    return res.status(400).json({ error: "Message is too long" });
+  }
+  if (email && !EMAIL_RE.test(String(email).trim())) {
+    return res.status(400).json({ error: "That email address doesn't look valid" });
+  }
+  try {
+    await db.createContactMessage({
+      name: name ? String(name).trim().slice(0, 120) : null,
+      email: email ? String(email).trim().toLowerCase() : null,
+      message: trimmedMessage,
+    });
+    res.json({ success: true });
+  } catch (e) {
+    console.error("contact message failed to save:", e.message);
+    res.status(500).json({ error: "Could not send your message - please try again." });
+  }
+});
+app.get("/api/contact", async (req, res) => {
+  const ADMIN_API_KEY = process.env.ADMIN_API_KEY;
+  if (!ADMIN_API_KEY || req.headers["x-admin-key"] !== ADMIN_API_KEY) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+  try {
+    const messages = await db.listContactMessages();
+    res.json({ messages });
+  } catch (e) {
+    console.error("listing contact messages failed:", e.message);
+    res.status(500).json({ error: "Could not load messages" });
+  }
+});
+
 const fs = require("fs");
 const FRONTEND_INDEX = path.join(__dirname, "index.html");
 app.use(express.static(__dirname));
