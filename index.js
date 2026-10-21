@@ -1,5 +1,4 @@
 require("dotenv").config();
-const path = require("path");
 const express = require("express");
 const cors = require("cors");
 const bcrypt = require("bcryptjs");
@@ -7,24 +6,76 @@ const jwt = require("jsonwebtoken");
 const { OAuth2Client } = require("google-auth-library");
 
 const db = require("./db");
-const { createOrder, verifyPaymentSignature, verifyWebhookSignature } = require("./razorpay");
+const crypto = require("crypto");
+const { createOrder, confirmPayment, expectedAmount, verifyWebhookSignature } = require("./razorpay");
 
 const app = express();
 const PORT = process.env.PORT || 4000;
-const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
+// Render sits behind a proxy; trust one hop so req.ip is the real client.
+app.set("trust proxy", 1);
+// CORS: an explicit allowlist instead of "*". CORS_ORIGIN may be a
+// comma-separated list; the default is the production site (+ localhost for dev).
+const CORS_ORIGINS = (process.env.CORS_ORIGIN ||
+  "https://physicaledmastery.com,https://www.physicaledmastery.com,http://localhost:3000,http://localhost:8000,http://127.0.0.1:8000")
+  .split(",").map((o) => o.trim()).filter(Boolean);
 
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) {
-  console.warn(
-    "JWT_SECRET is not set - using an insecure development default. " +
-      "Set a real random JWT_SECRET in Render's environment variables before real users sign up."
+  console.error(
+    "JWT_SECRET is not set - using a random per-process secret, so every restart signs all users out. " +
+      "Set a real random JWT_SECRET in Render's environment variables."
   );
 }
-const EFFECTIVE_JWT_SECRET = JWT_SECRET || "dev-insecure-secret-change-me";
+// Never fall back to a publicly-known string: that would let anyone forge a login.
+const EFFECTIVE_JWT_SECRET = JWT_SECRET || crypto.randomBytes(48).toString("hex");
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
 const googleClient = GOOGLE_CLIENT_ID ? new OAuth2Client(GOOGLE_CLIENT_ID) : null;
 
-app.use(cors({ origin: CORS_ORIGIN }));
+app.use(
+  cors({
+    origin: (origin, cb) => cb(null, !origin || CORS_ORIGINS.includes("*") || CORS_ORIGINS.includes(origin)),
+  })
+);
+
+// Minimal in-memory fixed-window rate limiter (no extra dependency). Good
+// enough to blunt credential-stuffing and contact-form spam on one instance.
+function rateLimit({ windowMs, max }) {
+  const hits = new Map();
+  setInterval(() => {
+    const now = Date.now();
+    for (const [k, v] of hits) if (v.reset <= now) hits.delete(k);
+  }, windowMs).unref();
+  return (req, res, next) => {
+    const key = req.ip;
+    const now = Date.now();
+    const entry = hits.get(key);
+    if (!entry || entry.reset <= now) {
+      hits.set(key, { count: 1, reset: now + windowMs });
+      return next();
+    }
+    entry.count++;
+    if (entry.count > max) {
+      res.set("Retry-After", String(Math.ceil((entry.reset - now) / 1000)));
+      return res.status(429).json({ error: "Too many requests - please wait a minute and try again." });
+    }
+    next();
+  };
+}
+const authLimiter = rateLimit({ windowMs: 60_000, max: 10 });
+const contactLimiter = rateLimit({ windowMs: 10 * 60_000, max: 5 });
+const orderLimiter = rateLimit({ windowMs: 60_000, max: 20 });
+
+// Fulfils a CONFIRMED payment exactly once. Safe to call from both the
+// browser flow and the webhook: a payment id that is already recorded is a
+// no-op, and a plan is only ever raised, never lowered.
+async function fulfilPayment({ userId, plan, examId, orderId, paymentId, amount }, source) {
+  if (!(await db.hasPayment(paymentId))) {
+    if (plan === "exampass") await db.grantExamPass(userId, examId);
+    else await db.setPlanAtLeast(userId, plan);
+    await db.recordOrder(userId, { orderId, paymentId, amount, source });
+  }
+  return db.getUser(userId);
+}
 
 app.post(
   "/api/webhook",
@@ -43,35 +94,36 @@ app.post(
       return res.status(400).send("Invalid signature");
     }
 
-    const event = JSON.parse(req.body.toString("utf8"));
+    let event;
+    try {
+      event = JSON.parse(req.body.toString("utf8"));
+    } catch (e) {
+      return res.status(400).send("Bad payload");
+    }
     if (event.event === "payment.captured") {
       const payment = event.payload.payment.entity;
       const { userId, plan, examId } = payment.notes || {};
-      if (userId && plan) {
+      const want = expectedAmount(plan);
+      if (userId && plan && want && payment.amount === want && (plan !== "exampass" || examId)) {
         try {
-          if (plan === "exampass" && examId) {
-            await db.grantExamPass(userId, examId);
-          } else {
-            await db.setPlan(userId, plan);
-          }
-          await db.recordOrder(userId, {
-            orderId: payment.order_id,
-            paymentId: payment.id,
-            amount: payment.amount,
-            source: "webhook",
-          });
+          await fulfilPayment(
+            { userId, plan, examId, orderId: payment.order_id, paymentId: payment.id, amount: payment.amount },
+            "webhook"
+          );
           console.log(`[webhook] Activated "${plan}"${examId ? ` (${examId})` : ""} for user ${userId}`);
         } catch (e) {
           console.error("[webhook] Failed to persist plan/order:", e.message);
           return res.status(500).send("Failed to record payment");
         }
+      } else {
+        console.warn("[webhook] Ignoring payment.captured with missing/mismatched notes or amount:", payment.id);
       }
     }
     res.json({ received: true });
   }
 );
 
-app.use(express.json());
+app.use(express.json({ limit: "100kb" }));
 
 // ---------------------------------------------------------------------------
 // Auth helpers
@@ -123,11 +175,11 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 // ---------------------------------------------------------------------------
 // Auth routes
 // ---------------------------------------------------------------------------
-app.post("/api/auth/signup", async (req, res) => {
+app.post("/api/auth/signup", authLimiter, async (req, res) => {
   const { email, password, name, preferredExam } = req.body || {};
   const normalizedEmail = String(email || "").trim().toLowerCase();
-  if (!EMAIL_RE.test(normalizedEmail) || !password || String(password).length < 6) {
-    return res.status(400).json({ error: "A valid email and a password of at least 6 characters are required" });
+  if (!EMAIL_RE.test(normalizedEmail) || !password || String(password).length < 6 || String(password).length > 72) {
+    return res.status(400).json({ error: "A valid email and a password of 6-72 characters are required" });
   }
   try {
     const existing = await db.getAccountByEmail(normalizedEmail);
@@ -144,7 +196,7 @@ app.post("/api/auth/signup", async (req, res) => {
   }
 });
 
-app.post("/api/auth/login", async (req, res) => {
+app.post("/api/auth/login", authLimiter, async (req, res) => {
   const { email, password } = req.body || {};
   const normalizedEmail = String(email || "").trim().toLowerCase();
   if (!normalizedEmail || !password) {
@@ -166,7 +218,7 @@ app.post("/api/auth/login", async (req, res) => {
   }
 });
 
-app.post("/api/auth/google", async (req, res) => {
+app.post("/api/auth/google", authLimiter, async (req, res) => {
   if (!googleClient) {
     return res.status(501).json({ error: "Google sign-in isn't configured on the server yet" });
   }
@@ -175,8 +227,11 @@ app.post("/api/auth/google", async (req, res) => {
   try {
     const ticket = await googleClient.verifyIdToken({ idToken: credential, audience: GOOGLE_CLIENT_ID });
     const payload = ticket.getPayload();
-    const { sub, email, name } = payload;
+    const { sub, email, name, email_verified: emailVerified } = payload;
     const normalizedEmail = String(email || "").toLowerCase();
+    if (!normalizedEmail || emailVerified !== true) {
+      return res.status(401).json({ error: "Your Google email address is not verified." });
+    }
     let account = await db.getAccountByGoogleSub(sub);
     if (!account) {
       const byEmail = await db.getAccountByEmail(normalizedEmail);
@@ -229,8 +284,22 @@ app.get("/api/plan/:userId", async (req, res) => {
     res.status(500).json({ error: "Could not look up plan" });
   }
 });
-app.post("/api/create-order", async (req, res) => {
-  const { userId, plan, examId } = req.body || {};
+// If the caller is signed in, the order is bound to their verified account id,
+// whatever userId the browser sent. Guests keep their local id (as before).
+function optionalAuth(req, _res, next) {
+  const header = req.headers.authorization || "";
+  if (header.startsWith("Bearer ")) {
+    try {
+      req.accountId = jwt.verify(header.slice(7), EFFECTIVE_JWT_SECRET).sub;
+    } catch (e) {
+      /* invalid token: treat as guest */
+    }
+  }
+  next();
+}
+app.post("/api/create-order", orderLimiter, optionalAuth, async (req, res) => {
+  const { plan, examId } = req.body || {};
+  const userId = req.accountId || (req.body || {}).userId;
   if (!userId || !plan) {
     return res.status(400).json({ error: "userId and plan are required" });
   }
@@ -255,40 +324,31 @@ app.post("/api/create-order", async (req, res) => {
     res.status(500).json({ error: message });
   }
 });
-app.post("/api/verify-payment", async (req, res) => {
+app.post("/api/verify-payment", orderLimiter, async (req, res) => {
   const {
-    userId,
-    plan,
-    examId,
     razorpay_order_id: orderId,
     razorpay_payment_id: paymentId,
     razorpay_signature: signature,
   } = req.body || {};
 
-  if (!userId || !plan || !orderId || !paymentId || !signature) {
+  if (!orderId || !paymentId || !signature) {
     return res.status(400).json({ error: "Missing required fields" });
   }
-  if (plan === "exampass" && !examId) {
-    return res.status(400).json({ error: "examId is required to verify an exam pass payment" });
-  }
 
-  const valid = verifyPaymentSignature({ orderId, paymentId, signature });
-  if (!valid) {
-    console.warn(`Signature mismatch for user ${userId}, order ${orderId}`);
-    return res.status(400).json({ error: "Payment signature verification failed" });
+  let confirmed;
+  try {
+    // userId / plan / examId come from Razorpay's own order record, NOT from
+    // the request body - the browser cannot choose what it is paying for.
+    confirmed = await confirmPayment({ orderId, paymentId, signature });
+  } catch (e) {
+    console.warn(`verify-payment rejected for order ${orderId}: ${e.message}`);
+    return res.status(e.status || 500).json({ error: e.message });
   }
 
   try {
-    if (plan === "exampass") {
-      await db.grantExamPass(userId, examId);
-      await db.recordOrder(userId, { orderId, paymentId, source: "verify-payment" });
-      const examPasses = await db.getExamPasses(userId);
-      res.json({ success: true, examPasses });
-    } else {
-      const user = await db.setPlan(userId, plan);
-      await db.recordOrder(userId, { orderId, paymentId, source: "verify-payment" });
-      res.json({ success: true, plan: user.plan });
-    }
+    const user = await fulfilPayment(confirmed, "verify-payment");
+    if (confirmed.plan === "exampass") res.json({ success: true, examPasses: user.examPasses });
+    else res.json({ success: true, plan: user.plan });
   } catch (e) {
     console.error("verify-payment failed to persist:", e.message);
     res.status(500).json({ error: "Payment verified but could not be saved - contact support." });
@@ -301,7 +361,7 @@ app.post("/api/verify-payment", async (req, res) => {
 // published anywhere on the site itself.
 // ---------------------------------------------------------------------------
 const CONTACT_MESSAGE_MAX = 4000;
-app.post("/api/contact", async (req, res) => {
+app.post("/api/contact", contactLimiter, async (req, res) => {
   const { name, email, message } = req.body || {};
   const trimmedMessage = String(message || "").trim();
   if (!trimmedMessage) {
@@ -335,18 +395,13 @@ app.get("/api/contact", requireAdmin, async (req, res) => {
   }
 });
 
-const fs = require("fs");
-const FRONTEND_INDEX = path.join(__dirname, "index.html");
-app.use(express.static(__dirname));
-app.get("*", (req, res) => {
-  if (fs.existsSync(FRONTEND_INDEX)) {
-    res.sendFile(FRONTEND_INDEX);
-  } else {
-    res.status(200).json({
-      status: "PE Prep payments API is running",
-      note: "index.html not deployed here - this service is API-only.",
-    });
-  }
+// This service is API-only. It must NOT serve its own directory (that would
+// publish index.js, db.js, package.json ... to the internet).
+app.get("/", (req, res) => {
+  res.status(200).json({ status: "PE Prep API is running" });
+});
+app.use((req, res) => {
+  res.status(404).json({ error: "Not found" });
 });
 
 db.ensureSchema()

@@ -33,6 +33,10 @@ async function ensureSchema() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
+  // Payment hygiene: one row per Razorpay payment (replays / duplicate
+  // webhooks can't double-record) and a fast lookup by user.
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS orders_payment_id_uq ON orders(payment_id) WHERE payment_id IS NOT NULL;`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS orders_user_id_idx ON orders(user_id);`);
   // Real login accounts (email+password and/or Google). A signed-in user's
   // `id` here doubles as their `user_id` in the `users`/`orders` tables
   // above, so their plan/payment history keeps working unchanged once they
@@ -149,13 +153,31 @@ async function setPlan(userId, plan) {
   return { plan: rows[0].plan, updatedAt: rows[0].updated_at };
 }
 
+const PLAN_RANK = { free: 0, pro: 1, proplus: 2 };
+
+// Only ever moves a user UP the plan ladder, so replaying an old/cheaper
+// payment can never downgrade somebody who has since bought a higher plan.
+async function setPlanAtLeast(userId, plan) {
+  const current = await getUser(userId);
+  if ((PLAN_RANK[plan] ?? -1) <= (PLAN_RANK[current.plan] ?? 0)) {
+    return { plan: current.plan, updatedAt: current.updatedAt };
+  }
+  return setPlan(userId, plan);
+}
+
+async function hasPayment(paymentId) {
+  const { rows } = await pool.query("SELECT 1 FROM orders WHERE payment_id = $1 LIMIT 1", [paymentId]);
+  return rows.length > 0;
+}
+
 async function recordOrder(userId, order) {
   await pool.query(
     `INSERT INTO users (user_id, plan) VALUES ($1, 'free') ON CONFLICT (user_id) DO NOTHING`,
     [userId]
   );
   await pool.query(
-    `INSERT INTO orders (user_id, order_id, payment_id, amount, source) VALUES ($1, $2, $3, $4, $5)`,
+    `INSERT INTO orders (user_id, order_id, payment_id, amount, source) VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT DO NOTHING`,
     [userId, order.orderId || null, order.paymentId || null, order.amount || null, order.source || null]
   );
 }
@@ -212,6 +234,17 @@ const PROFILE_FIELD_COLUMNS = {
   preferredExam: "preferred_exam",
 };
 
+const INT_FIELDS = new Set(["xp", "streak", "questionsSolved", "accuracySum", "mockTestsTaken"]);
+function sanitizeProfileValue(key, value) {
+  if (key === "revealedIds") return value && typeof value === "object" ? value : {};
+  if (key === "name") return String(value).slice(0, 40);
+  if (INT_FIELDS.has(key)) {
+    const n = Math.floor(Number(value));
+    return Number.isFinite(n) ? Math.min(Math.max(n, 0), 100000000) : 0;
+  }
+  return value == null ? null : String(value).slice(0, 80);
+}
+
 async function updateAccountProfile(accountId, fields) {
   const sets = [];
   const values = [accountId];
@@ -219,7 +252,8 @@ async function updateAccountProfile(accountId, fields) {
   for (const [key, column] of Object.entries(PROFILE_FIELD_COLUMNS)) {
     if (fields[key] === undefined) continue;
     sets.push(`${column} = $${i}`);
-    values.push(key === "revealedIds" ? JSON.stringify(fields[key]) : (key === "name" ? String(fields[key]).slice(0, 40) : fields[key]));
+    const clean = sanitizeProfileValue(key, fields[key]);
+    values.push(key === "revealedIds" ? JSON.stringify(clean) : clean);
     i++;
   }
   if (sets.length === 0) return getAccountById(accountId);
@@ -232,7 +266,7 @@ async function updateAccountProfile(accountId, fields) {
 }
 
 module.exports = {
-  pool, ensureSchema, getUser, setPlan, recordOrder, getExamPasses, grantExamPass,
+  pool, ensureSchema, getUser, setPlan, setPlanAtLeast, hasPayment, recordOrder, getExamPasses, grantExamPass,
   createAccount, getAccountByEmail, getAccountByGoogleSub, getAccountById, linkGoogleSub, updateAccountProfile,
   createContactMessage, listContactMessages,
 };
