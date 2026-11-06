@@ -303,6 +303,9 @@ app.post("/api/create-order", orderLimiter, optionalAuth, async (req, res) => {
   if (!userId || !plan) {
     return res.status(400).json({ error: "userId and plan are required" });
   }
+  if (!["pro", "proplus", "exampass"].includes(plan)) {
+    return res.status(400).json({ error: 'Unknown plan. Expected "pro", "proplus" or "exampass".' });
+  }
   if (plan === "exampass" && !examId) {
     return res.status(400).json({ error: "examId is required to buy an exam pass" });
   }

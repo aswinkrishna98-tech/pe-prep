@@ -132,6 +132,15 @@ test("auth: short/long password rejected, rate limit kicks in, CORS restricted",
   assert.equal(last, 429);
 });
 
+test("create-order: unknown plan or missing fields give 400, not 500", async () => {
+  let r = await post("/api/create-order", { userId: "u_val", plan: "gold" });
+  assert.equal(r.status, 400);
+  r = await post("/api/create-order", { userId: "u_val", plan: "exampass" });
+  assert.equal(r.status, 400);
+  r = await post("/api/create-order", { plan: "pro" });
+  assert.equal(r.status, 400);
+});
+
 test("contact form: public POST works, admin GET requires auth", async () => {
   assert.equal((await post("/api/contact", { message: "hello" })).status, 200);
   assert.equal((await fetch(BASE + "/api/contact")).status, 401);
