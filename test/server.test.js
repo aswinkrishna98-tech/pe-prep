@@ -146,4 +146,39 @@ test("contact form: public POST works, admin GET requires auth", async () => {
   assert.equal((await fetch(BASE + "/api/contact")).status, 401);
 });
 
+test("play billing: verifies token with Google, grants once, blocks reuse by another account", async () => {
+  const play = require("../play");
+  let acks = 0;
+  const TOKENS = { tok_pro: { purchaseState: 0, acknowledgementState: 0, orderId: "GPA.1" }, tok_pending: { purchaseState: 2 }, tok_pass: { purchaseState: 0, acknowledgementState: 1, orderId: "GPA.2" } };
+  play.fetchPurchase = async (productId, token) => {
+    if (!TOKENS[token]) throw Object.assign(new Error("Purchase not found"), { status: 402 });
+    return { purchase: TOKENS[token], accessToken: "x" };
+  };
+  play.acknowledge = async () => { acks++; };
+  const db = require("../db");
+  const jwt = require("jsonwebtoken");
+  const mk = async (email) => jwt.sign({ sub: (await db.createAccount({ email, name: "P" })).id }, "test-jwt");
+  const a = await mk("play-a@example.com"), b = await mk("play-b@example.com");
+  const H = (t) => ({ Authorization: "Bearer " + t, "X-Forwarded-For": "198.51.100." + Math.floor(Math.random() * 250) });
+  // not signed in / bad input
+  assert.equal((await post("/api/play/verify", { productId: "pro", purchaseToken: "tok_pro" })).status, 401);
+  assert.equal((await post("/api/play/verify", { productId: "gold", purchaseToken: "tok_pro" }, H(a))).status, 400);
+  assert.equal((await post("/api/play/verify", { productId: "pass_nope", purchaseToken: "tok_pass" }, H(a))).status, 400);
+  // unknown token and pending purchase grant nothing
+  assert.equal((await post("/api/play/verify", { productId: "pro", purchaseToken: "tok_missing" }, H(a))).status, 402);
+  assert.equal((await post("/api/play/verify", { productId: "pro", purchaseToken: "tok_pending" }, H(a))).status, 402);
+  // a paid token grants the plan and is acknowledged
+  let r = await post("/api/play/verify", { productId: "pro", purchaseToken: "tok_pro" }, H(a));
+  assert.equal(r.status, 200);
+  assert.equal((await r.json()).plan, "pro");
+  assert.equal(acks, 1);
+  // same account may re-send (restore), another account may not reuse the token
+  assert.equal((await post("/api/play/verify", { productId: "pro", purchaseToken: "tok_pro" }, H(a))).status, 200);
+  assert.equal((await post("/api/play/verify", { productId: "pro", purchaseToken: "tok_pro" }, H(b))).status, 409);
+  // exam pass
+  r = await post("/api/play/verify", { productId: "pass_ugc_net", purchaseToken: "tok_pass" }, H(b));
+  assert.equal(r.status, 200);
+  assert.deepEqual((await r.json()).examPasses, ["ugc-net"]);
+});
+
 test("teardown", () => { setTimeout(() => process.exit(process.exitCode || 0), 200); });
