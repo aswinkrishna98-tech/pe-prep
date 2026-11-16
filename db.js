@@ -170,6 +170,11 @@ async function hasPayment(paymentId) {
   return rows.length > 0;
 }
 
+async function getPaymentOwner(paymentId) {
+  const { rows } = await pool.query("SELECT user_id FROM orders WHERE payment_id = $1 LIMIT 1", [paymentId]);
+  return rows[0] ? rows[0].user_id : null;
+}
+
 async function recordOrder(userId, order) {
   await pool.query(
     `INSERT INTO users (user_id, plan) VALUES ($1, 'free') ON CONFLICT (user_id) DO NOTHING`,
@@ -266,7 +271,7 @@ async function updateAccountProfile(accountId, fields) {
 }
 
 module.exports = {
-  pool, ensureSchema, getUser, setPlan, setPlanAtLeast, hasPayment, recordOrder, getExamPasses, grantExamPass,
+  pool, ensureSchema, getUser, setPlan, setPlanAtLeast, hasPayment, getPaymentOwner, recordOrder, getExamPasses, grantExamPass,
   createAccount, getAccountByEmail, getAccountByGoogleSub, getAccountById, linkGoogleSub, updateAccountProfile,
   createContactMessage, listContactMessages,
 };

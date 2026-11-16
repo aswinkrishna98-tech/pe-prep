@@ -7,6 +7,7 @@ const { OAuth2Client } = require("google-auth-library");
 
 const db = require("./db");
 const crypto = require("crypto");
+const play = require("./play");
 const { createOrder, confirmPayment, expectedAmount, verifyWebhookSignature } = require("./razorpay");
 
 const app = express();
@@ -357,6 +358,44 @@ app.post("/api/verify-payment", orderLimiter, async (req, res) => {
     res.status(500).json({ error: "Payment verified but could not be saved - contact support." });
   }
 });
+
+// ---------------------------------------------------------------------------
+// Google Play Billing (Android app). The signed-in user's app sends the
+// purchase token Play gave it; we confirm it with Google, grant access, and
+// acknowledge it. Requires a real account so the purchase follows the user.
+// ---------------------------------------------------------------------------
+const PLAY_EXAM_IDS = ["kvs-pgt","nvs","dsssb","ugc-net","state-psc","bped","mped","university","set","ctet","emrs","sainik-school","awes"];
+app.post("/api/play/verify", orderLimiter, requireAuth, async (req, res) => {
+  const { productId, purchaseToken } = req.body || {};
+  if (!productId || !purchaseToken || typeof purchaseToken !== "string" || purchaseToken.length > 2000) {
+    return res.status(400).json({ error: "productId and purchaseToken are required" });
+  }
+  const grant = play.productToGrant(productId, PLAY_EXAM_IDS);
+  if (!grant) return res.status(400).json({ error: "Unknown product" });
+  const userId = req.accountId;
+  const paymentId = "play:" + crypto.createHash("sha256").update(purchaseToken).digest("hex").slice(0, 48);
+  try {
+    const owner = await db.getPaymentOwner(paymentId);
+    if (owner && owner !== userId) {
+      return res.status(409).json({ error: "This purchase is already linked to another account" });
+    }
+    const { purchase, accessToken } = await play.fetchPurchase(productId, purchaseToken);
+    if (!play.isPaid(purchase)) {
+      return res.status(402).json({ error: purchase && purchase.purchaseState === 2 ? "Payment is still pending" : "Purchase is not complete" });
+    }
+    const user = await fulfilPayment(
+      { userId, plan: grant.plan, examId: grant.examId, orderId: purchase.orderId || null, paymentId, amount: null },
+      "google-play"
+    );
+    if (purchase.acknowledgementState !== 1) await play.acknowledge(productId, purchaseToken, accessToken);
+    if (grant.plan === "exampass") res.json({ success: true, examPasses: user.examPasses });
+    else res.json({ success: true, plan: user.plan });
+  } catch (e) {
+    console.error("play verify failed:", e.message);
+    res.status(e.status || 500).json({ error: e.message || "Could not verify purchase" });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Contact form. Public POST so any visitor can reach out; GET is read-only
 // and requires a valid signed-in session for one of ADMIN_EMAILS (see
