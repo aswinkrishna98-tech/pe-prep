@@ -34,7 +34,7 @@ const post = (path, body, headers = {}) =>
 
 test.before(async () => {
   const db = require("../db");
-  await db.pool.query("DROP TABLE IF EXISTS orders, exam_passes, users, accounts, contact_messages CASCADE");
+  await db.pool.query("DROP TABLE IF EXISTS orders, exam_passes, users, accounts, contact_messages, email_signups CASCADE");
   require("../index");
   for (let i = 0; i < 50; i++) { try { await fetch(BASE + "/"); return; } catch { await new Promise((r) => setTimeout(r, 100)); } }
 });
@@ -144,6 +144,17 @@ test("create-order: unknown plan or missing fields give 400, not 500", async () 
 test("contact form: public POST works, admin GET requires auth", async () => {
   assert.equal((await post("/api/contact", { message: "hello" })).status, 200);
   assert.equal((await fetch(BASE + "/api/contact")).status, 401);
+});
+
+test("email capture: validates, de-duplicates, admin-only list", async () => {
+  assert.equal((await post("/api/subscribe", { email: "a@b.co", topic: "exam:nvs" })).status, 200);
+  assert.equal((await post("/api/subscribe", { email: "A@B.co", topic: "exam:nvs" })).status, 200); // duplicate is harmless
+  assert.equal((await post("/api/subscribe", { email: "nope", topic: "alerts" })).status, 400);
+  assert.equal((await post("/api/subscribe", { email: "a@b.co", topic: "Bad Topic!" })).status, 400);
+  assert.equal((await fetch(BASE + "/api/subscribe")).status, 401);
+  const db = require("../db");
+  const { rows } = await db.pool.query("SELECT count(*)::int AS n FROM email_signups");
+  assert.equal(rows[0].n, 1);
 });
 
 test("play billing: verifies token with Google, grants once, blocks reuse by another account", async () => {
