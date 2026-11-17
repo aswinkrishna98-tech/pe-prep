@@ -437,6 +437,43 @@ app.get("/api/contact", requireAdmin, async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// Email capture: "notify me" for exams that are not launched yet, new-test
+// alerts and site updates. Public + rate limited; the list is admin-read only.
+// ---------------------------------------------------------------------------
+const signupLimiter = rateLimit({ windowMs: 10 * 60_000, max: 10 });
+const SIGNUP_TOPIC_RE = /^[a-z0-9:_-]{1,60}$/; // e.g. "exam:nvs", "alerts", "updates"
+app.post("/api/subscribe", signupLimiter, async (req, res) => {
+  const { email, topic, referralCode } = req.body || {};
+  const cleanEmail = String(email || "").trim().toLowerCase();
+  if (!EMAIL_RE.test(cleanEmail) || cleanEmail.length > 200) {
+    return res.status(400).json({ error: "That email address doesn't look valid" });
+  }
+  const cleanTopic = String(topic || "alerts").trim().toLowerCase();
+  if (!SIGNUP_TOPIC_RE.test(cleanTopic)) {
+    return res.status(400).json({ error: "Unknown topic" });
+  }
+  try {
+    await db.createEmailSignup({
+      email: cleanEmail,
+      topic: cleanTopic,
+      referralCode: referralCode ? String(referralCode).trim().slice(0, 40) : null,
+    });
+    res.json({ success: true });
+  } catch (e) {
+    console.error("email signup failed to save:", e.message);
+    res.status(500).json({ error: "Could not save your email - please try again." });
+  }
+});
+app.get("/api/subscribe", requireAdmin, async (req, res) => {
+  try {
+    res.json({ signups: await db.listEmailSignups() });
+  } catch (e) {
+    console.error("listing email signups failed:", e.message);
+    res.status(500).json({ error: "Could not load signups" });
+  }
+});
+
 // This service is API-only. It must NOT serve its own directory (that would
 // publish index.js, db.js, package.json ... to the internet).
 app.get("/", (req, res) => {

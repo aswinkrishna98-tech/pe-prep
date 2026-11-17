@@ -92,6 +92,33 @@ async function ensureSchema() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
+  // Email-capture list: "notify me when <exam> launches", "new test alerts",
+  // "updates". One row per (email, topic) so repeat sign-ups are harmless.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS email_signups (
+      id SERIAL PRIMARY KEY,
+      email TEXT NOT NULL,
+      topic TEXT NOT NULL,
+      referral_code TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE (email, topic)
+    );
+  `);
+}
+
+async function createEmailSignup({ email, topic, referralCode }) {
+  await pool.query(
+    `INSERT INTO email_signups (email, topic, referral_code) VALUES ($1, $2, $3)
+     ON CONFLICT (email, topic) DO NOTHING`,
+    [email, topic, referralCode || null]
+  );
+}
+
+async function listEmailSignups() {
+  const { rows } = await pool.query(
+    `SELECT id, email, topic, referral_code AS "referralCode", created_at AS "createdAt" FROM email_signups ORDER BY created_at DESC LIMIT 1000`
+  );
+  return rows;
 }
 
 async function createContactMessage({ name, email, message }) {
@@ -273,5 +300,5 @@ async function updateAccountProfile(accountId, fields) {
 module.exports = {
   pool, ensureSchema, getUser, setPlan, setPlanAtLeast, hasPayment, getPaymentOwner, recordOrder, getExamPasses, grantExamPass,
   createAccount, getAccountByEmail, getAccountByGoogleSub, getAccountById, linkGoogleSub, updateAccountProfile,
-  createContactMessage, listContactMessages,
+  createContactMessage, listContactMessages, createEmailSignup, listEmailSignups,
 };
